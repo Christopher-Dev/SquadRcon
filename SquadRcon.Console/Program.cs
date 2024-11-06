@@ -10,8 +10,8 @@ class Program
     static async Task Main(string[] args)
     {
         string host = "198.133.237.27"; // Replace with your host
-        int port = 10267;          // Replace with your port
-        string password = "hvgdwVPhvk9S7sGA4Cf2z9TW5z"; // Replace with your password
+        int port = 10272;          // Replace with your port
+        string password = "1234567890"; // Replace with your password
 
         var rconInstance = new RconInstance(host, port, password);
 

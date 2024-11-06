@@ -4,179 +4,63 @@ using SquadRcon.Classes.Packets;
 using System.Collections.Concurrent;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading.Channels;
 
 namespace SquadRcon
 {
-    public class RconInstance
+    public class RconInstance : IDisposable
     {
         private TcpClient tcpClient;
-
         private NetworkStream stream;
+        private readonly MemoryStream receivedDataBuffer = new();
+        private readonly Channel<Packet> commandQueue = Channel.CreateUnbounded<Packet>();
+        private readonly List<string> accumulatedBuffer = new();
+        private readonly byte[] buffer = new byte[4];
+        private readonly SemaphoreSlim streamLock = new(1, 1);  // Prevents concurrent access to stream
 
-        private readonly byte[] buffer;
-
-        private readonly ConcurrentQueue<Packet> commandQueue;
-
-        private BinaryReader binaryReader;
-
-        #region ServerInfo
-
-        public string Host { get; private set; }
-
-        public int Port { get; private set; }
-
-        public string Password { get; private set; }
-
-        #endregion
-
-        private List<string> accumulatedBuffer;
-
-        public bool IsAuthorized { get; set; } = false;
-
-        private bool Connected;
-
-        private bool sendingCommand;
-
-
-        private CancellationTokenSource cancellationTokenSource;
-
-        public DateTimeOffset ConnectedOn { get; set; }
-
-        public DateTimeOffset KeepAliveuntil { get; set; }
+        public string Host { get; }
+        public int Port { get; }
+        public string Password { get; }
+        public bool IsAuthorized { get; private set; } = false;
+        public DateTimeOffset ConnectedOn { get; private set; }
 
         public RconInstance(string host, int port, string password)
         {
-            this.Host = host;
-            this.Port = port;
-            this.Password = password;
-
-            Connected = false;
-
-            cancellationTokenSource = new CancellationTokenSource();
-
-            accumulatedBuffer = new List<string>();
-
-            commandQueue = new ConcurrentQueue<Packet>();
-
-            buffer = new byte[4096];
-
-
+            Host = host;
+            Port = port;
+            Password = password;
         }
 
         public async Task StartAsync(CancellationToken token)
         {
             try
             {
-                
-                try
-                {
-                    tcpClient = new TcpClient();
-                    await tcpClient.ConnectAsync(Host, Port);
-                    stream = tcpClient.GetStream();
-                    binaryReader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true);
+                tcpClient = new TcpClient();
+                await tcpClient.ConnectAsync(Host, Port, token);
+                stream = tcpClient.GetStream();
+                ConnectedOn = DateTimeOffset.Now;
 
-                    await Task.Delay(100);
+                // Start the data reception and command processing tasks
+                _ = Task.Run(() => ReceiveDataAsync(token), token);
+                _ = Task.Run(() => ProcessCommandsAsync(token), token);
 
-                    BeginTasks(cancellationToken: cancellationTokenSource.Token);
-
-                    await Authorize(Password);
-
-                    await ServerPoll();
-                }
-                catch(Exception ex)
-                {
-                    Console.WriteLine($"Error: {ex.Message}");
-                }
-            }
-            catch(Exception ex)
-            {
-                Console.WriteLine($"Error: {ex.Message}");
-            }
-        }
-
-        private async Task BeginTasks(CancellationToken cancellationToken)
-        {
-
-            try
-            {
-                var receiveDataTask = ReceiveDataAsync(cancellationToken);
-
-                var commandProcessingTask = CommandProcessingTask(cancellationToken);
-
-                //await Task.WhenAll(receiveDataTask, commandProcessingTask);
+                await AuthorizeAsync(Password);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"An error occurred while receiving data: {ex.Message}");
+                Console.WriteLine($"Connection Error: {ex.Message}");
             }
-
         }
 
-        public async Task CommandProcessingTask(CancellationToken cancellationToken)
+        private async Task ProcessCommandsAsync(CancellationToken cancellationToken)
         {
-            var serverPollScheduler = new ServerPollScheduler(TimeSpan.FromSeconds(5));
-            serverPollScheduler.Start();
-
-            try
+            await foreach (var command in commandQueue.Reader.ReadAllAsync(cancellationToken))
             {
-                while (!cancellationToken.IsCancellationRequested)
-                {
-                    await PollAndProcessCommands(cancellationToken);
-
-                    if (serverPollScheduler.IsTimeToPoll)
-                    {
-                        await ServerPoll();
-                        serverPollScheduler.Reset();
-                    }
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                HandleCancellation();
-            }
-            catch (Exception ex)
-            {
-                HandleException(ex);
-            }
-            finally
-            {
-                serverPollScheduler.Stop();
+                await ProcessCommandAsync(command, cancellationToken);
             }
         }
 
-        private async Task PollAndProcessCommands(CancellationToken cancellationToken)
-        {
-            if (commandQueue.TryDequeue(out var command))
-            {
-                await ProcessCommandAsync(command);
-            }
-            else
-            {
-                await Task.Delay(100, cancellationToken);
-            }
-        }
-
-        private void HandleCancellation()
-        {
-            // Cancellation specific logic
-        }
-
-        private void HandleException(Exception ex)
-        {
-            Console.WriteLine($"An error occurred in command processing: {ex.Message}");
-        }
-
-        public async Task ServerPoll()
-        {
-            await ShowServerInfo();
-        }
-
-        public async Task ShowServerInfo()
-        {
-            var authPacket = new Packet(RconConstants.SERVERDATA_EXECCOMMAND, 89, "ShowServerInfo");
-            commandQueue.Enqueue(authPacket);
-        }
-        private async Task ProcessCommandAsync(Packet command)
+        private async Task ProcessCommandAsync(Packet command, CancellationToken cancellationToken)
         {
             var payload = Encoding.UTF8.GetBytes(command.Body);
             var size = payload.Length + 14;
@@ -187,128 +71,102 @@ namespace SquadRcon
             payload.CopyTo(buffer, 12);
             BitConverter.GetBytes((short)0).CopyTo(buffer, size - 2);
 
-            // Convert buffer to hex string
-            string hex = BitConverter.ToString(buffer).Replace("-", "");
-
-            //// Write hex string to console
-            //Console.WriteLine($"Sending packet: {hex}");
-
-            await stream.WriteAsync(buffer, 0, size);
-            await stream.FlushAsync();
+            await streamLock.WaitAsync(cancellationToken);  // Prevent concurrent writes
+            try
+            {
+                await stream.WriteAsync(buffer.AsMemory(0, size), cancellationToken);
+                await stream.FlushAsync(cancellationToken);
+            }
+            finally
+            {
+                streamLock.Release();
+            }
         }
 
-
-
-        public async Task ReceiveDataAsync(CancellationToken cancellationToken)
+        private async Task ReceiveDataAsync(CancellationToken cancellationToken)
         {
-            while (tcpClient.Connected)
+            while (tcpClient.Connected && !cancellationToken.IsCancellationRequested)
             {
+                if (!stream.DataAvailable)
+                {
+                    await Task.Delay(100, cancellationToken);
+                    continue;
+                }
+
                 try
                 {
-                    // Throw if cancellation is requested
-                    cancellationToken.ThrowIfCancellationRequested();
-
-                    if (stream.DataAvailable)
+                    int size = await ReadInt32Async(cancellationToken);
+                    if (size > 0)
                     {
-                        // Read the size of the packet
-                        int size = binaryReader.ReadInt32();
-                        if (size > 0 && size <= 4096) // Size validation
-                        {
-                            // Create a buffer for the rest of the packet
-                            var buffer = new byte[size];
-
-                            // Read the rest of the packet into the buffer
-                            int bytesRead = binaryReader.Read(buffer, 0, buffer.Length);
-                            if (bytesRead == 0)
-                            {
-                                break;
-                            }
-
-
-                            await ParseResponse(buffer);
-                        }
-                    }
-                    else
-                    {
-                        // Use cancellationToken in Task.Delay
-                        await Task.Delay(100, cancellationToken); // Wait for data
+                        var dataBuffer = new byte[size];
+                        int bytesRead = await stream.ReadAsync(dataBuffer.AsMemory(0, size), cancellationToken);
+                        if (bytesRead > 0) await ParseResponseAsync(dataBuffer);
                     }
                 }
-                catch (OperationCanceledException)
+                catch (Exception ex) when (ex is OperationCanceledException or IOException)
                 {
-                    Console.WriteLine("Data reception canceled.");
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Error: {ex.Message}");
+                    Console.WriteLine($"Receive Data Error: {ex.Message}");
                     break;
                 }
             }
         }
-        public async Task ClearBuffer()
+
+        private async Task<int> ReadInt32Async(CancellationToken cancellationToken)
         {
-            accumulatedBuffer.Clear();
+            int bytesRead = await stream.ReadAsync(buffer.AsMemory(0, 4), cancellationToken);
+            return bytesRead == 4 ? BitConverter.ToInt32(buffer, 0) : 0;
         }
 
-        public async Task PrintBytesAsAscii()
+        private async Task ParseResponseAsync(byte[] buffer)
         {
-            foreach (var item in accumulatedBuffer)
-            {
-
-                Console.WriteLine(item);
-
-            }
-
-            await ClearBuffer();
-        }
-
-
-        public async Task ParseResponse(byte[] buffer)
-        {
-
             var packet = new ResponsePacket(buffer);
-
-
             switch (packet.Type)
             {
                 case RconConstants.AuthSuccess:
-                    Console.WriteLine($"Authentication Success Response");
+                    Console.WriteLine("Authentication Success");
+                    IsAuthorized = true;
                     break;
                 case RconConstants.SERVERDATA_CHAT_VALUE:
-                    Console.WriteLine($"{packet.Body.FirstOrDefault()}");
+                    Console.WriteLine(packet.Body.FirstOrDefault());
                     break;
-                //Do nothing with empty packets
                 case RconConstants.EmptyPacket:
                     break;
                 case RconConstants.SERVERDATA_RESPONSE_VALUE:
                     accumulatedBuffer.AddRange(packet.Body);
                     break;
                 case RconConstants.CommandComplete:
-                    PrintBytesAsAscii();
+                    await PrintBytesAsAsciiAsync();
                     break;
                 default:
-                    Console.WriteLine($"Error Parsing Response");
+                    Console.WriteLine("Error Parsing Response");
                     break;
             }
-
         }
 
-
-
-        public async Task Authorize(string password)
+        public async Task AuthorizeAsync(string password)
         {
             var authPacket = new Packet(RconConstants.SERVERDATA_AUTH, -1, password);
-            commandQueue.Enqueue(authPacket);
-            IsAuthorized = true;
+            await commandQueue.Writer.WriteAsync(authPacket);
         }
 
         public async Task SendCommandAsync(Packet packet)
         {
-            sendingCommand = true;
-            commandQueue.Enqueue(packet);
-            commandQueue.Enqueue(new Packet(RconConstants.SERVERDATA_EXECCOMMAND, 99, ""));
-            sendingCommand = false;
+            await commandQueue.Writer.WriteAsync(packet);
+            await commandQueue.Writer.WriteAsync(new Packet(RconConstants.SERVERDATA_EXECCOMMAND, 99, ""));
+        }
+
+        public async Task PrintBytesAsAsciiAsync()
+        {
+            accumulatedBuffer.ForEach(Console.WriteLine);
+            accumulatedBuffer.Clear();
+        }
+
+        public void Dispose()
+        {
+            stream?.Dispose();
+            tcpClient?.Dispose();
+            streamLock.Dispose();
         }
     }
+
 }
