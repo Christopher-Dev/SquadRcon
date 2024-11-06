@@ -8,7 +8,7 @@ using System.Threading.Channels;
 
 namespace SquadRcon
 {
-    public class RconInstance : IAsyncDisposable
+    public class RconClient : IAsyncDisposable
     {
         private TcpClient tcpClient;
         private NetworkStream stream;
@@ -26,14 +26,14 @@ namespace SquadRcon
         public bool IsAuthorized { get; private set; } = false;
         public DateTimeOffset ConnectedOn { get; private set; }
 
-        public RconInstance(string host, int port, string password)
+        public RconClient(string host, int port, string password)
         {
             Host = host;
             Port = port;
             Password = password;
         }
 
-        public async Task StartAsync(CancellationToken token)
+        public async Task ConnectAsync(CancellationToken token)
         {
             try
             {
@@ -45,9 +45,9 @@ namespace SquadRcon
                 ConnectedOn = DateTimeOffset.Now;
 
                 _ = Task.Run(() => ReceiveDataAsync(token), token);
-                _ = Task.Run(() => ProcessCommandsAsync(token), token);
+                _ = Task.Run(() => ProcessCommandQueueAsync(token), token);
 
-                await AuthorizeAsync(Password).ConfigureAwait(false);
+                await AuthenticateAsync(Password).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -55,15 +55,15 @@ namespace SquadRcon
             }
         }
 
-        private async ValueTask ProcessCommandsAsync(CancellationToken cancellationToken)
+        private async ValueTask ProcessCommandQueueAsync(CancellationToken cancellationToken)
         {
             await foreach (var command in commandQueue.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
             {
-                await SendCommandToStreamAsync(command, cancellationToken).ConfigureAwait(false);
+                await WriteCommandToStreamAsync(command, cancellationToken).ConfigureAwait(false);
             }
         }
 
-        private async ValueTask SendCommandToStreamAsync(Packet command, CancellationToken cancellationToken)
+        private async ValueTask WriteCommandToStreamAsync(Packet command, CancellationToken cancellationToken)
         {
             var payload = Encoding.UTF8.GetBytes(command.Body);
             var size = payload.Length + 14;
@@ -150,13 +150,13 @@ namespace SquadRcon
             }
         }
 
-        public async ValueTask AuthorizeAsync(string password)
+        public async ValueTask AuthenticateAsync(string password)
         {
             var authPacket = new Packet(RconConstants.SERVERDATA_AUTH, -1, password);
             await commandQueue.Writer.WriteAsync(authPacket).ConfigureAwait(false);
         }
 
-        public async ValueTask SendCommandAsync(Packet packet)
+        public async ValueTask QueueCommandAsync(Packet packet)
         {
             await commandQueue.Writer.WriteAsync(packet).ConfigureAwait(false);
             await commandQueue.Writer.WriteAsync(new Packet(RconConstants.SERVERDATA_EXECCOMMAND, 99, "")).ConfigureAwait(false);

@@ -13,7 +13,7 @@ class Program
         int port = 10272;          // Replace with your port
         string password = "1234567890"; // Replace with your password
 
-        var rconInstance = new RconInstance(host, port, password);
+        var rconInstance = new RconClient(host, port, password);
 
         CancellationTokenSource cts = new CancellationTokenSource();
 
@@ -23,7 +23,7 @@ class Program
             cts.Cancel();
         };
 
-        await rconInstance.StartAsync(cts.Token);
+        await rconInstance.ConnectAsync(cts.Token);
 
         while (!cts.Token.IsCancellationRequested)
         {
@@ -36,7 +36,7 @@ class Program
             }
 
             // Send the command to the Rcon server
-            await rconInstance.SendCommandAsync(new Packet(RconConstants.SERVERDATA_EXECCOMMAND, 99, command));
+            await rconInstance.QueueCommandAsync(new Packet(RconConstants.SERVERDATA_EXECCOMMAND, 99, command));
         }
 
         Console.WriteLine("Disconnecting...");
