@@ -8,15 +8,17 @@ using System.Threading.Channels;
 
 namespace SquadRcon
 {
-    public class RconInstance : IDisposable
+    public class RconInstance : IAsyncDisposable
     {
         private TcpClient tcpClient;
         private NetworkStream stream;
-        private readonly MemoryStream receivedDataBuffer = new();
-        private readonly Channel<Packet> commandQueue = Channel.CreateUnbounded<Packet>();
-        private readonly List<string> accumulatedBuffer = new();
-        private readonly byte[] buffer = new byte[4];
-        private readonly SemaphoreSlim streamLock = new(1, 1);  // Prevents concurrent access to stream
+        private readonly Channel<Packet> commandQueue = Channel.CreateBounded<Packet>(new BoundedChannelOptions(100)
+        {
+            FullMode = BoundedChannelFullMode.Wait
+        });
+        private readonly StringBuilder responseBuilder = new();
+        private readonly byte[] readBuffer = new byte[4];
+        private readonly SemaphoreSlim streamLock = new(1, 1);
 
         public string Host { get; }
         public int Port { get; }
@@ -36,15 +38,16 @@ namespace SquadRcon
             try
             {
                 tcpClient = new TcpClient();
-                await tcpClient.ConnectAsync(Host, Port, token);
+                tcpClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+
+                await tcpClient.ConnectAsync(Host, Port, token).ConfigureAwait(false);
                 stream = tcpClient.GetStream();
                 ConnectedOn = DateTimeOffset.Now;
 
-                // Start the data reception and command processing tasks
                 _ = Task.Run(() => ReceiveDataAsync(token), token);
                 _ = Task.Run(() => ProcessCommandsAsync(token), token);
 
-                await AuthorizeAsync(Password);
+                await AuthorizeAsync(Password).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -52,15 +55,15 @@ namespace SquadRcon
             }
         }
 
-        private async Task ProcessCommandsAsync(CancellationToken cancellationToken)
+        private async ValueTask ProcessCommandsAsync(CancellationToken cancellationToken)
         {
-            await foreach (var command in commandQueue.Reader.ReadAllAsync(cancellationToken))
+            await foreach (var command in commandQueue.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
             {
-                await ProcessCommandAsync(command, cancellationToken);
+                await SendCommandToStreamAsync(command, cancellationToken).ConfigureAwait(false);
             }
         }
 
-        private async Task ProcessCommandAsync(Packet command, CancellationToken cancellationToken)
+        private async ValueTask SendCommandToStreamAsync(Packet command, CancellationToken cancellationToken)
         {
             var payload = Encoding.UTF8.GetBytes(command.Body);
             var size = payload.Length + 14;
@@ -71,11 +74,11 @@ namespace SquadRcon
             payload.CopyTo(buffer, 12);
             BitConverter.GetBytes((short)0).CopyTo(buffer, size - 2);
 
-            await streamLock.WaitAsync(cancellationToken);  // Prevent concurrent writes
+            await streamLock.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                await stream.WriteAsync(buffer.AsMemory(0, size), cancellationToken);
-                await stream.FlushAsync(cancellationToken);
+                await stream.WriteAsync(buffer, cancellationToken).ConfigureAwait(false);
+                await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
             }
             finally
             {
@@ -89,21 +92,25 @@ namespace SquadRcon
             {
                 if (!stream.DataAvailable)
                 {
-                    await Task.Delay(100, cancellationToken);
+                    await Task.Yield();
                     continue;
                 }
 
                 try
                 {
-                    int size = await ReadInt32Async(cancellationToken);
+                    int size = await ReadInt32Async(cancellationToken).ConfigureAwait(false);
                     if (size > 0)
                     {
                         var dataBuffer = new byte[size];
-                        int bytesRead = await stream.ReadAsync(dataBuffer.AsMemory(0, size), cancellationToken);
-                        if (bytesRead > 0) await ParseResponseAsync(dataBuffer);
+                        int bytesRead = await stream.ReadAsync(dataBuffer.AsMemory(0, size), cancellationToken).ConfigureAwait(false);
+                        if (bytesRead > 0) await ParseResponseAsync(dataBuffer).ConfigureAwait(false);
                     }
                 }
-                catch (Exception ex) when (ex is OperationCanceledException or IOException)
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (IOException ex)
                 {
                     Console.WriteLine($"Receive Data Error: {ex.Message}");
                     break;
@@ -111,13 +118,13 @@ namespace SquadRcon
             }
         }
 
-        private async Task<int> ReadInt32Async(CancellationToken cancellationToken)
+        private async ValueTask<int> ReadInt32Async(CancellationToken cancellationToken)
         {
-            int bytesRead = await stream.ReadAsync(buffer.AsMemory(0, 4), cancellationToken);
-            return bytesRead == 4 ? BitConverter.ToInt32(buffer, 0) : 0;
+            int bytesRead = await stream.ReadAsync(readBuffer, cancellationToken).ConfigureAwait(false);
+            return bytesRead == 4 ? BitConverter.ToInt32(readBuffer, 0) : 0;
         }
 
-        private async Task ParseResponseAsync(byte[] buffer)
+        private async ValueTask ParseResponseAsync(byte[] buffer)
         {
             var packet = new ResponsePacket(buffer);
             switch (packet.Type)
@@ -132,10 +139,10 @@ namespace SquadRcon
                 case RconConstants.EmptyPacket:
                     break;
                 case RconConstants.SERVERDATA_RESPONSE_VALUE:
-                    accumulatedBuffer.AddRange(packet.Body);
+                    responseBuilder.AppendJoin(Environment.NewLine, packet.Body);
                     break;
                 case RconConstants.CommandComplete:
-                    await PrintBytesAsAsciiAsync();
+                    await PrintResponseAsync().ConfigureAwait(false);
                     break;
                 default:
                     Console.WriteLine("Error Parsing Response");
@@ -143,28 +150,34 @@ namespace SquadRcon
             }
         }
 
-        public async Task AuthorizeAsync(string password)
+        public async ValueTask AuthorizeAsync(string password)
         {
             var authPacket = new Packet(RconConstants.SERVERDATA_AUTH, -1, password);
-            await commandQueue.Writer.WriteAsync(authPacket);
+            await commandQueue.Writer.WriteAsync(authPacket).ConfigureAwait(false);
         }
 
-        public async Task SendCommandAsync(Packet packet)
+        public async ValueTask SendCommandAsync(Packet packet)
         {
-            await commandQueue.Writer.WriteAsync(packet);
-            await commandQueue.Writer.WriteAsync(new Packet(RconConstants.SERVERDATA_EXECCOMMAND, 99, ""));
+            await commandQueue.Writer.WriteAsync(packet).ConfigureAwait(false);
+            await commandQueue.Writer.WriteAsync(new Packet(RconConstants.SERVERDATA_EXECCOMMAND, 99, "")).ConfigureAwait(false);
         }
 
-        public async Task PrintBytesAsAsciiAsync()
+        private async ValueTask PrintResponseAsync()
         {
-            accumulatedBuffer.ForEach(Console.WriteLine);
-            accumulatedBuffer.Clear();
+            Console.WriteLine(responseBuilder.ToString());
+            responseBuilder.Clear();
         }
 
-        public void Dispose()
+        public async ValueTask DisposeAsync()
         {
-            stream?.Dispose();
-            tcpClient?.Dispose();
+            if (stream != null)
+            {
+                await stream.DisposeAsync().ConfigureAwait(false);
+            }
+            if (tcpClient != null)
+            {
+                tcpClient.Dispose();
+            }
             streamLock.Dispose();
         }
     }
