@@ -208,6 +208,8 @@ public class RconClient : IRconClient
     private readonly IPacketProcessor _packetProcessor;
     private INetworkStreamWrapper _stream;
     private readonly byte[] _readBuffer = new byte[4];
+    private readonly Timer _keepAliveTimer;
+    private readonly CancellationTokenSource _cancellationTokenSource = new();
 
     // Events
     public event EventHandler<AuthenticationEventArgs> AuthenticationResult;
@@ -239,6 +241,9 @@ public class RconClient : IRconClient
             OnChatMessageReceived,
             OnCommandResponseReceived,
             OnErrorOccurred);
+
+        // Initialize keep-alive timer (disabled initially)
+        _keepAliveTimer = new Timer(SendKeepAlive, null, Timeout.Infinite, Timeout.Infinite);
     }
 
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
@@ -249,8 +254,8 @@ public class RconClient : IRconClient
             ConnectedOn = DateTimeOffset.Now;
 
             // Start background tasks
-            _ = Task.Run(() => ReceiveDataAsync(cancellationToken), cancellationToken);
-            _ = Task.Run(() => ProcessCommandQueueAsync(cancellationToken), cancellationToken);
+            _ = Task.Run(() => ReceiveDataAsync(_cancellationTokenSource.Token), _cancellationTokenSource.Token);
+            _ = Task.Run(() => ProcessCommandQueueAsync(_cancellationTokenSource.Token), _cancellationTokenSource.Token);
 
             await AuthenticateAsync(Password);
         }
@@ -258,6 +263,41 @@ public class RconClient : IRconClient
         {
             OnErrorOccurred($"Connection Error: {ex.Message}", ex);
             throw;
+        }
+    }
+
+    private void SendKeepAlive(object state)
+    {
+        if (!_connectionManager.IsConnected || !IsAuthorized)
+            return;
+
+        try
+        {
+            // Send an empty string command as keep-alive
+            var keepAlivePacket = new Packet(RconConstants.SERVERDATA_EXECCOMMAND, Environment.TickCount, "");
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await _commandQueue.Writer.WriteAsync(keepAlivePacket, _cancellationTokenSource.Token);
+                }
+                catch (InvalidOperationException)
+                {
+                    // Channel is closed, which is expected during disposal
+                }
+                catch (OperationCanceledException)
+                {
+                    // Expected when cancellation is requested
+                }
+                catch (Exception ex)
+                {
+                    OnErrorOccurred($"Keep-alive error: {ex.Message}", ex);
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            OnErrorOccurred($"Keep-alive timer error: {ex.Message}", ex);
         }
     }
 
@@ -371,6 +411,8 @@ public class RconClient : IRconClient
         if (isSuccess)
         {
             IsAuthorized = true;
+            // Start keep-alive timer after successful authentication
+            _keepAliveTimer.Change(TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
         }
         AuthenticationResult?.Invoke(this, new AuthenticationEventArgs(isSuccess));
     }
@@ -392,7 +434,19 @@ public class RconClient : IRconClient
 
     public async ValueTask DisposeAsync()
     {
+        // Stop the keep-alive timer
+        _keepAliveTimer?.Dispose();
+
+        // Cancel all background operations
+        _cancellationTokenSource.Cancel();
+
+        // Complete the command queue
         _commandQueue.Writer.Complete();
+
+        // Dispose connection manager
         await _connectionManager.DisposeAsync();
+
+        // Dispose cancellation token source
+        _cancellationTokenSource.Dispose();
     }
 }

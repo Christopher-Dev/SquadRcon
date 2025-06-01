@@ -15,7 +15,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\SquadRcon.Classes\SquadRcon.Classes.csproj" />
-    <ProjectReference Include="..\SquadRcon\SquadRcon.csproj" />
+    <ProjectReference Include="..\SquadRcon\SquadRcon.SDK.csproj" />
   </ItemGroup>
 
 </Project>

@@ -4,7 +4,7 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 
-namespace SquadRcon
+namespace SquadRcon.SDK
 {
     class ServerPollScheduler
     {
