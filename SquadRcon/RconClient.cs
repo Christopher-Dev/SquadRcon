@@ -8,6 +8,36 @@ using System.Threading.Channels;
 
 namespace SquadRcon
 {
+    // Event argument classes for different response types
+    public class AuthenticationEventArgs : EventArgs
+    {
+        public bool IsSuccess { get; }
+        public AuthenticationEventArgs(bool isSuccess) => IsSuccess = isSuccess;
+    }
+
+    public class ChatMessageEventArgs : EventArgs
+    {
+        public string Message { get; }
+        public ChatMessageEventArgs(string message) => Message = message;
+    }
+
+    public class CommandResponseEventArgs : EventArgs
+    {
+        public string Response { get; }
+        public CommandResponseEventArgs(string response) => Response = response;
+    }
+
+    public class RconErrorEventArgs : EventArgs
+    {
+        public string ErrorMessage { get; }
+        public System.Exception Exception { get; }
+        public RconErrorEventArgs(string errorMessage, System.Exception exception = null)
+        {
+            ErrorMessage = errorMessage;
+            Exception = exception;
+        }
+    }
+
     public class RconClient : IAsyncDisposable
     {
         private TcpClient tcpClient;
@@ -19,6 +49,12 @@ namespace SquadRcon
         private readonly StringBuilder responseBuilder = new();
         private readonly byte[] readBuffer = new byte[4];
         private readonly SemaphoreSlim streamLock = new(1, 1);
+
+        // Events
+        public event EventHandler<AuthenticationEventArgs> AuthenticationResult;
+        public event EventHandler<ChatMessageEventArgs> ChatMessageReceived;
+        public event EventHandler<CommandResponseEventArgs> CommandResponseReceived;
+        public event EventHandler<RconErrorEventArgs> ErrorOccurred;
 
         public string Host { get; }
         public int Port { get; }
@@ -49,9 +85,9 @@ namespace SquadRcon
 
                 await AuthenticateAsync(Password).ConfigureAwait(false);
             }
-            catch (Exception ex)
+            catch (System.Exception ex)
             {
-                Console.WriteLine($"Connection Error: {ex.Message}");
+                OnErrorOccurred($"Connection Error: {ex.Message}", ex);
             }
         }
 
@@ -112,7 +148,7 @@ namespace SquadRcon
                 }
                 catch (IOException ex)
                 {
-                    Console.WriteLine($"Receive Data Error: {ex.Message}");
+                    OnErrorOccurred($"Receive Data Error: {ex.Message}", ex);
                     break;
                 }
             }
@@ -130,11 +166,15 @@ namespace SquadRcon
             switch (packet.Type)
             {
                 case RconConstants.AuthSuccess:
-                    Console.WriteLine("Authentication Success");
                     IsAuthorized = true;
+                    OnAuthenticationResult(true);
                     break;
                 case RconConstants.SERVERDATA_CHAT_VALUE:
-                    Console.WriteLine(packet.Body.FirstOrDefault());
+                    var chatMessage = packet.Body.FirstOrDefault();
+                    if (!string.IsNullOrEmpty(chatMessage))
+                    {
+                        OnChatMessageReceived(chatMessage);
+                    }
                     break;
                 case RconConstants.EmptyPacket:
                     break;
@@ -142,10 +182,10 @@ namespace SquadRcon
                     responseBuilder.AppendJoin(Environment.NewLine, packet.Body);
                     break;
                 case RconConstants.CommandComplete:
-                    await PrintResponseAsync().ConfigureAwait(false);
+                    await ProcessCompleteResponseAsync().ConfigureAwait(false);
                     break;
                 default:
-                    Console.WriteLine("Error Parsing Response");
+                    OnErrorOccurred("Error Parsing Response - Unknown packet type received");
                     break;
             }
         }
@@ -162,10 +202,32 @@ namespace SquadRcon
             await commandQueue.Writer.WriteAsync(new Packet(RconConstants.SERVERDATA_EXECCOMMAND, 99, "")).ConfigureAwait(false);
         }
 
-        private async ValueTask PrintResponseAsync()
+        private async ValueTask ProcessCompleteResponseAsync()
         {
-            Console.WriteLine(responseBuilder.ToString());
+            var response = responseBuilder.ToString();
+            OnCommandResponseReceived(response);
             responseBuilder.Clear();
+        }
+
+        // Event trigger methods
+        protected virtual void OnAuthenticationResult(bool isSuccess)
+        {
+            AuthenticationResult?.Invoke(this, new AuthenticationEventArgs(isSuccess));
+        }
+
+        protected virtual void OnChatMessageReceived(string message)
+        {
+            ChatMessageReceived?.Invoke(this, new ChatMessageEventArgs(message));
+        }
+
+        protected virtual void OnCommandResponseReceived(string response)
+        {
+            CommandResponseReceived?.Invoke(this, new CommandResponseEventArgs(response));
+        }
+
+        protected virtual void OnErrorOccurred(string errorMessage, System.Exception exception = null)
+        {
+            ErrorOccurred?.Invoke(this, new RconErrorEventArgs(errorMessage, exception));
         }
 
         public async ValueTask DisposeAsync()
@@ -181,5 +243,4 @@ namespace SquadRcon
             streamLock.Dispose();
         }
     }
-
 }
