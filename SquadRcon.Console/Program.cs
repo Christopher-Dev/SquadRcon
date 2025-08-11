@@ -1,5 +1,5 @@
-﻿using SquadRcon.Classes;
-using SquadRcon.Classes.Constants;
+﻿using SquadRcon;
+using SquadRcon.Constants;
 
 class Program
 {

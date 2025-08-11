@@ -1,7 +1,6 @@
-﻿// Event argument classes
-using SquadRcon.Classes;
-using SquadRcon.Classes.Constants;
-using SquadRcon.Classes.Packets;
+// Event argument classes
+using SquadRcon.Constants;
+using SquadRcon.Packets;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Channels;
@@ -27,8 +26,8 @@ public class CommandResponseEventArgs : EventArgs
 public class RconErrorEventArgs : EventArgs
 {
     public string ErrorMessage { get; }
-    public Exception Exception { get; }
-    public RconErrorEventArgs(string errorMessage, Exception exception = null)
+    public Exception? Exception { get; }
+    public RconErrorEventArgs(string errorMessage, Exception? exception = null)
     {
         ErrorMessage = errorMessage;
         Exception = exception;
@@ -50,7 +49,7 @@ public interface IRconClient : IAsyncDisposable
 
     Task ConnectAsync(CancellationToken cancellationToken = default);
     ValueTask AuthenticateAsync(string password);
-    ValueTask QueueCommandAsync(Packet packet);
+    ValueTask QueueCommandAsync(SquadRcon.Packet packet);
 }
 
 public interface IPacketProcessor
@@ -97,13 +96,13 @@ public class RconPacketProcessor : IPacketProcessor
     private readonly Action<bool> _onAuthenticated;
     private readonly Action<string> _onChatMessage;
     private readonly Action<string> _onCommandResponse;
-    private readonly Action<string, Exception> _onError;
+    private readonly Action<string, Exception?> _onError;
 
     public RconPacketProcessor(
         Action<bool> onAuthenticated,
         Action<string> onChatMessage,
         Action<string> onCommandResponse,
-        Action<string, Exception> onError)
+        Action<string, Exception?> onError)
     {
         _onAuthenticated = onAuthenticated ?? throw new ArgumentNullException(nameof(onAuthenticated));
         _onChatMessage = onChatMessage ?? throw new ArgumentNullException(nameof(onChatMessage));
@@ -120,7 +119,7 @@ public class RconPacketProcessor : IPacketProcessor
                 break;
 
             case RconConstants.SERVERDATA_CHAT_VALUE:
-                var chatMessage = packet.Body.FirstOrDefault();
+                var chatMessage = packet.Body?.FirstOrDefault();
                 if (!string.IsNullOrEmpty(chatMessage))
                 {
                     _onChatMessage(chatMessage);
@@ -132,7 +131,10 @@ public class RconPacketProcessor : IPacketProcessor
                 break;
 
             case RconConstants.SERVERDATA_RESPONSE_VALUE:
-                _responseBuilder.AppendJoin(Environment.NewLine, packet.Body);
+                if (packet.Body != null)
+                {
+                    _responseBuilder.AppendJoin(Environment.NewLine, packet.Body);
+                }
                 break;
 
             case RconConstants.CommandComplete:
@@ -157,8 +159,8 @@ public class RconPacketProcessor : IPacketProcessor
 // Connection manager - Single Responsibility
 public class RconConnectionManager : IAsyncDisposable
 {
-    private TcpClient _tcpClient;
-    private INetworkStreamWrapper _stream;
+    private TcpClient? _tcpClient;
+    private INetworkStreamWrapper? _stream;
     private readonly SemaphoreSlim _streamLock = new(1, 1);
 
     public bool IsConnected => _tcpClient?.Connected == true;
@@ -204,18 +206,18 @@ public class RconConnectionManager : IAsyncDisposable
 public class RconClient : IRconClient
 {
     private readonly RconConnectionManager _connectionManager;
-    private readonly Channel<Packet> _commandQueue;
+    private readonly Channel<SquadRcon.Packet> _commandQueue;
     private readonly IPacketProcessor _packetProcessor;
-    private INetworkStreamWrapper _stream;
+    private INetworkStreamWrapper? _stream;
     private readonly byte[] _readBuffer = new byte[4];
     private readonly Timer _keepAliveTimer;
     private readonly CancellationTokenSource _cancellationTokenSource = new();
 
     // Events
-    public event EventHandler<AuthenticationEventArgs> AuthenticationResult;
-    public event EventHandler<ChatMessageEventArgs> ChatMessageReceived;
-    public event EventHandler<CommandResponseEventArgs> CommandResponseReceived;
-    public event EventHandler<RconErrorEventArgs> ErrorOccurred;
+    public event EventHandler<AuthenticationEventArgs>? AuthenticationResult;
+    public event EventHandler<ChatMessageEventArgs>? ChatMessageReceived;
+    public event EventHandler<CommandResponseEventArgs>? CommandResponseReceived;
+    public event EventHandler<RconErrorEventArgs>? ErrorOccurred;
 
     // Properties
     public string Host { get; }
@@ -224,14 +226,14 @@ public class RconClient : IRconClient
     public bool IsAuthorized { get; private set; }
     public DateTimeOffset ConnectedOn { get; private set; }
 
-    public RconClient(string host, int port, string password, IPacketProcessor packetProcessor = null)
+    public RconClient(string host, int port, string password, IPacketProcessor? packetProcessor = null)
     {
         Host = host ?? throw new ArgumentNullException(nameof(host));
         Port = port;
         Password = password ?? throw new ArgumentNullException(nameof(password));
 
         _connectionManager = new RconConnectionManager();
-        _commandQueue = Channel.CreateBounded<Packet>(new BoundedChannelOptions(100)
+        _commandQueue = Channel.CreateBounded<SquadRcon.Packet>(new BoundedChannelOptions(100)
         {
             FullMode = BoundedChannelFullMode.Wait
         });
@@ -274,7 +276,7 @@ public class RconClient : IRconClient
         try
         {
             // Send an empty string command as keep-alive
-            var keepAlivePacket = new Packet(RconConstants.SERVERDATA_EXECCOMMAND, Environment.TickCount, "");
+            var keepAlivePacket = new SquadRcon.Packet(RconConstants.SERVERDATA_EXECCOMMAND, Environment.TickCount, "");
             _ = Task.Run(async () =>
             {
                 try
@@ -320,7 +322,7 @@ public class RconClient : IRconClient
         }
     }
 
-    private async ValueTask WriteCommandToStreamAsync(Packet command, CancellationToken cancellationToken)
+    private async ValueTask WriteCommandToStreamAsync(SquadRcon.Packet command, CancellationToken cancellationToken)
     {
         var payload = Encoding.UTF8.GetBytes(command.Body);
         var size = payload.Length + 14;
@@ -395,14 +397,14 @@ public class RconClient : IRconClient
 
     public async ValueTask AuthenticateAsync(string password)
     {
-        var authPacket = new Packet(RconConstants.SERVERDATA_AUTH, -1, password);
+        var authPacket = new SquadRcon.Packet(RconConstants.SERVERDATA_AUTH, -1, password);
         await _commandQueue.Writer.WriteAsync(authPacket);
     }
 
-    public async ValueTask QueueCommandAsync(Packet packet)
+    public async ValueTask QueueCommandAsync(SquadRcon.Packet packet)
     {
         await _commandQueue.Writer.WriteAsync(packet);
-        await _commandQueue.Writer.WriteAsync(new Packet(RconConstants.SERVERDATA_EXECCOMMAND, 99, ""));
+        await _commandQueue.Writer.WriteAsync(new SquadRcon.Packet(RconConstants.SERVERDATA_EXECCOMMAND, 99, ""));
     }
 
     // Event trigger methods - made private as they're implementation details
@@ -427,7 +429,7 @@ public class RconClient : IRconClient
         CommandResponseReceived?.Invoke(this, new CommandResponseEventArgs(response));
     }
 
-    private void OnErrorOccurred(string errorMessage, Exception exception = null)
+    private void OnErrorOccurred(string errorMessage, Exception? exception = null)
     {
         ErrorOccurred?.Invoke(this, new RconErrorEventArgs(errorMessage, exception));
     }
