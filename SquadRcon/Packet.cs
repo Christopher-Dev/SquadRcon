@@ -1,17 +1,17 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 
-namespace SquadRcon.Classes
+namespace SquadRcon
 {
     public class Packet
     {
         public int Size { get; set; }
         public int Id { get; set; }
         public int Type { get; set; }
-        public string Body { get; set; }
+        public string Body { get; set; } = string.Empty;
 
         public Packet(int type, int id, string body)
         {
